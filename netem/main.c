@@ -32,6 +32,9 @@
 #include <rte_mempool.h>
 #include <rte_mbuf.h>
 #include <rte_string_fns.h>
+#include <rte_ip.h>
+#include <rte_udp.h>
+#include <rte_tcp.h>
 
 static volatile bool force_quit;
 
@@ -41,9 +44,22 @@ static volatile bool force_quit;
 #define BURST_TX_DRAIN_US 100 /* TX drain every ~100us */
 #define MEMPOOL_CACHE_SIZE 256
 
+// DEFINES FOR PACKET CLASIFICATION 
+#define IP_BROADCAST		FFFFFFFF
+#define UDP_PROTOCOL		17
+#define TCP_PROTOCOL		6
+#define IP_PROTOCOL_ICMP	1
+
+// profile queues
+struct rte_ring *udp_queue;
+struct rte_ring *tcp_queue;
+struct rte_ring *icmp_queue;
+struct rte_ring *default_queue;
+
 /*
  * Configurable number of RX/TX ring descriptors
  */
+// number of packets for receiving and sending
 #define RX_DESC_DEFAULT 1024
 #define TX_DESC_DEFAULT 1024
 static uint16_t nb_rxd = RX_DESC_DEFAULT;
@@ -161,6 +177,7 @@ netem_main_loop(void)
 		cur_tsc = rte_rdtsc();
 
 		diff_tsc = cur_tsc - prev_tsc;
+		// flush TX queue
 		if (unlikely(diff_tsc > drain_tsc)) {
 			buffer = tx_buffer[tx_port_id];
 
@@ -197,8 +214,12 @@ netem_main_loop(void)
 
 		port_statistics[rx_port_id].rx += nb_rx;
 
+		// put packet in one of the queues
 		for (i = 0; i < nb_rx; i++) {
-			m = pkts_burst[i];
+            m = pkts_burst[i];
+            rte_prefetch0(rte_pktmbuf_mtod(m, void *));
+
+			match_packet(m);
 
 			/* Drop one in 10 packets, the 5th one. */
 			if (i % 10 == 5) {
@@ -216,6 +237,57 @@ netem_main_loop(void)
 			sent = rte_eth_tx_buffer(tx_port_id, 0, buffer, m);
 			if (sent)
 				port_statistics[tx_port_id].tx += sent;
+        }
+	}
+}
+
+static void
+match_packet(void *m) {
+	struct rte_ether_hdr *eth_hdr;
+	struct rte_ipv4_hdr *ip_hdr;
+
+	// extract Ethernet header
+	eth_hdr = rte_pktmbuf_mtod(m, struct rte_ether_hdr *);
+
+	// app will only modify ipv4 packets
+	if (eth_hdr->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
+		// extract ip header
+		ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
+
+		// pattern match for a queue
+		// try to add packet to queue
+		// if queue is full. drop packet
+		if (ip_hdr->next_proto_id == UDP_PROTOCOL) {
+			if (rte_ring_enqueue(udp_queue, m) < 0) {
+				rte_pktmbuf_free(m);
+				port_statistics[rx_port_id].dropped++;
+			}
+		} 
+		else if (ip_hdr->next_proto_id == TCP_PROTOCOL) {
+			if (rte_ring_enqueue(tcp_queue, m) < 0) {
+				rte_pktmbuf_free(m);
+				port_statistics[rx_port_id].dropped++;
+			}
+		} 
+		else if (ip_hdr->next_proto_id == IP_PROTOCOL_ICMP) {
+			if (rte_ring_enqueue(icmp_queue, m) < 0) {
+				rte_pktmbuf_free(m);
+				port_statistics[rx_port_id].dropped++;
+			}
+		} 
+		else {
+			// add to default queue
+			if (rte_ring_enqueue(default_queue, m) < 0) {
+				rte_pktmbuf_free(m);
+				port_statistics[rx_port_id].dropped++;
+			}
+		}
+	} 
+	else {
+		// not ipv4 packet, just add to default queue
+		if (rte_ring_enqueue(default_queue, m) < 0) {
+			rte_pktmbuf_free(m);
+			port_statistics[rx_port_id].dropped++;
 		}
 	}
 }
@@ -262,10 +334,12 @@ main(int argc, char **argv)
 	/* convert to number of cycles */
 	timer_period *= rte_get_timer_hz();
 
+	// gets the number of available ports
 	nb_ports = rte_eth_dev_count_avail();
 	if (nb_ports == 0)
 		rte_exit(EXIT_FAILURE, "No Ethernet ports - bye\n");
 
+	// max between the 2 values
 	nb_mbufs = RTE_MAX(nb_ports * (nb_rxd + nb_txd + MAX_PKT_BURST +
 		nb_lcores * MEMPOOL_CACHE_SIZE), 8192U);
 
@@ -275,6 +349,16 @@ main(int argc, char **argv)
 		rte_socket_id());
 	if (netem_pktmbuf_pool == NULL)
 		rte_exit(EXIT_FAILURE, "Cannot init mbuf pool\n");
+
+	// queues
+	unsigned int ring_size = 4096;
+    udp_queue = rte_ring_create("udp_queue", ring_size, rte_socket_id(), 0);
+    tcp_queue = rte_ring_create("tcp_queue", ring_size, rte_socket_id(), 0);
+    icmp_queue = rte_ring_create("icmp_queue", ring_size, rte_socket_id(), 0);
+    default_queue = rte_ring_create("default_queue", ring_size, rte_socket_id(), 0);
+
+    if (udp_queue == NULL || tcp_queue == NULL || icmp_queue == NULL || default_queue == NULL)
+        rte_exit(EXIT_FAILURE, "Profile queues dead!\n");
 
 	/* Initialize each port */
 	RTE_ETH_FOREACH_DEV(portid) {
