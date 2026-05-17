@@ -35,6 +35,8 @@
 #include <rte_ip.h>
 #include <rte_udp.h>
 #include <rte_tcp.h>
+#include <rte_ring.h>
+#include <pthread.h>
 
 static volatile bool force_quit;
 
@@ -44,16 +46,23 @@ static volatile bool force_quit;
 #define BURST_TX_DRAIN_US 100 /* TX drain every ~100us */
 #define MEMPOOL_CACHE_SIZE 256
 
+// UDP PACKETS WILL BE DUPLICATED RANDOMLY
+// TCP WILL BE DROPPED RANDOMLY
+// ICMP WILL BE DELAYED RANDOMLY
 // DEFINES FOR PACKET CLASIFICATION 
 #define IP_BROADCAST		FFFFFFFF
 #define UDP_PROTOCOL		17
 #define TCP_PROTOCOL		6
 #define IP_PROTOCOL_ICMP	1
 
+#define DELAY_MIN_MS  50
+#define DELAY_MAX_MS 150
+
 // profile queues
 struct rte_ring *udp_queue;
 struct rte_ring *tcp_queue;
 struct rte_ring *icmp_queue;
+
 struct rte_ring *default_queue;
 
 /*
@@ -91,6 +100,24 @@ struct netem_port_statistics port_statistics[NB_PORTS];
 
 /* A tsc-based timer responsible for triggering statistics printout */
 static uint64_t timer_period = 1; /* default period is 1 seconds */
+
+/* Returns current time in nanoseconds */
+static inline uint64_t
+get_time_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+/* Returns a random delay in nanoseconds between min_ms and max_ms */
+static inline uint64_t
+random_delay_ns(uint64_t min_ms, uint64_t max_ms)
+{
+    uint64_t min_ns = min_ms * 1000000ULL;
+    uint64_t max_ns = max_ms * 1000000ULL;
+    return min_ns + (rte_rand() % (max_ns - min_ns));
+}
 
 /* Print out statistics on packets dropped */
 static void
@@ -172,6 +199,8 @@ netem_main_loop(void)
 
 	RTE_LOG(INFO, NETEM, "entering main loop on lcore %u\n", lcore_id);
 
+	pthread_cond_t *send_to_tx = malloc(sizeof(pthread_cond_t));
+
 	while (!force_quit) {
 		/* Drains the TX queue after a certain time */
 		cur_tsc = rte_rdtsc();
@@ -220,27 +249,56 @@ netem_main_loop(void)
             rte_prefetch0(rte_pktmbuf_mtod(m, void *));
 
 			match_packet(m);
+		}
 
-			/* Drop one in 10 packets, the 5th one. */
-			if (i % 10 == 5) {
-				/* ToDo: correctly drop based on total RX packets, not
-				 * while iterating the burst (e.g. 32 packets burst)
-				 */
-				rte_pktmbuf_free(m);
-				continue;
-			}
+		// matching is done. spawn a worker to start modifying the queues
+		// spawn a consumer that waits for the queues to be good for sending
 
-			rte_prefetch0(rte_pktmbuf_mtod(m, void *));
+		pthread_create(NULL, NULL, (void *)produser_thread, send_to_tx);
+		pthread_create(NULL, NULL, (void *)consumer_thread, send_to_tx);
 
-			buffer = tx_buffer[tx_port_id];
 
-			sent = rte_eth_tx_buffer(tx_port_id, 0, buffer, m);
-			if (sent)
-				port_statistics[tx_port_id].tx += sent;
-        }
+			// /* Drop one in 10 packets, the 5th one. */
+			// if (i % 10 == 5) {
+			// 	/* ToDo: correctly drop based on total RX packets, not
+			// 	 * while iterating the burst (e.g. 32 packets burst)
+			// 	 */
+			// 	rte_pktmbuf_free(m);
+			// 	continue;
+			// }
+
+			// buffer = tx_buffer[tx_port_id];
+
+			// sent = rte_eth_tx_buffer(tx_port_id, 0, buffer, m);
+			// if (sent)
+			// 	port_statistics[tx_port_id].tx += sent;
 	}
 }
 
+static void produser_thread(pthread_cond_t *send_to_tx) {
+	// go through each queue
+	// once every 5 packets do some magic
+
+	// UDP -> DUPLICATE
+	// TCP -> DROP
+	// ICMP DELAY
+
+	// after each queue is done signal pthread condition it is done
+}
+
+static void consumer_thread(pthread_cond_t *send_to_tx) {
+	// wait on send_to_tx to be done
+	// do something like so
+	// buffer = tx_buffer[tx_port_id];
+
+			// sent = rte_eth_tx_buffer(tx_port_id, 0, buffer, m);
+			// if (sent)
+			// 	port_statistics[tx_port_id].tx += sent;
+}
+
+
+// flag == 0, no modifications
+// flag == 1, packet will suffer modification as agreed by conventions (check defines)
 static void
 match_packet(void *m) {
 	struct rte_ether_hdr *eth_hdr;
