@@ -37,6 +37,7 @@
 #include <rte_tcp.h>
 #include <rte_ring.h>
 #include "main.h"
+#include "threads.h"
 
 static volatile bool force_quit;
 
@@ -181,30 +182,47 @@ netem_main_loop(void)
 	RTE_LOG(INFO, NETEM, "entering main loop on lcore %u\n", lcore_id);
 
 	// spawn threads
-	struct pthread_mutex_t *lock_TX = malloc(sizeof(pthread_mutex_t));
-	struct thread **threads = malloc(PQ_NR * sizeof(struct thread));
+	pthread_mutex_t *lock_TX = malloc(sizeof(pthread_mutex_t));
+	pthread_mutex_init(lock_TX, NULL);  
+
+	struct thread **threads = malloc((PQ_NR + 1) * sizeof(struct thread *));
 	for (int i = 1; i <= PQ_NR; i++) {
 		struct thread *thread = malloc(sizeof(struct thread));
 
-		char *name_buffer_in;
+		char name_buffer_in[32];
+    	char name_buffer_out[32];
 		sprintf(name_buffer_in, "buffer_in%d", i);
-		char *name_buffer_out;
-		sprintf(name_buffer_in, "buffer_out%d", i);
+		sprintf(name_buffer_out, "buffer_out%d", i);
 	
-		thread->buffer_in = te_ring_create(name_buffer_in, ring_size, rte_socket_id(), 0);
-		thread->buffer_out = te_ring_create(name_buffer_out, ring_size, rte_socket_id(), 0);
+		thread->buffer_in = rte_ring_create(name_buffer_in, RING_SIZE, rte_socket_id(), 0);
+		thread->buffer_out = rte_ring_create(name_buffer_out, RING_SIZE, rte_socket_id(), 0);
 
 		thread->cond_data_in = malloc(sizeof(pthread_cond_t));
 		thread->lock_data_in = malloc(sizeof(pthread_mutex_t));
 		thread->lock_TX = lock_TX;
 
 		pthread_cond_init(thread->cond_data_in, NULL);
+		pthread_mutex_init(thread->lock_data_in, NULL);  
 
 		// keep thread data in main array's storage
 		threads[i] = thread;
 
+		// alloc mem for input args for worker thread
+		struct pq_thread_args *args = malloc(sizeof(struct pq_thread_args));
+		if (args == NULL) {
+			// Handle memory allocation failure
+			fprintf(stderr, "Failed to allocate memory for thread args\n");
+			return -1;
+		}
+
+		// populate input struc
+		args->thread = thread;
+		args->tx_port_id = tx_port_id;
+		args->tx_buffer = tx_buffer;
+
 		thread->flag = i;
-		pthread_create(i, NULL, (void *) pq_thread, thread);
+		pthread_t tid;
+		pthread_create(&tid, NULL, (void *) pq_thread, args);
 	}
 
 	while (!force_quit) {
@@ -249,18 +267,26 @@ netem_main_loop(void)
 
 		port_statistics[rx_port_id].rx += nb_rx;
 
-		char **buffer_changed = malloc(PQ_NR);
+		// try to acquire all locks
+		for (int i = 1; i <= PQ_NR; i++)
+			pthread_mutex_lock(threads[i]->lock_data_in);
+
+		char buffer_changed[PQ_NR + 1] = {0};
 		// put packet in one of the queues
 		for (i = 0; i < nb_rx; i++) {
             m = pkts_burst[i];
             rte_prefetch0(rte_pktmbuf_mtod(m, void *));
 
-			match_packet(m, buffer_changed, threads);
+			match_packet(m, buffer_changed, threads, &rx_port_id);
 		}
 
+		// give all locks back
+		for (int i = 1; i <= PQ_NR; i++)
+			pthread_mutex_unlock(threads[i]->lock_data_in);
+
 		// tell each worker thread who has new data to wake up
-		for (int i = 1; i <= PQ_NR)
-			if (buffer_changed[PQ_NR] == 1)
+		for (int i = 1; i <= PQ_NR; i++)
+			if (buffer_changed[i] == 1)
 				pthread_cond_signal(threads[i]->cond_data_in);
 
 			// /* Drop one in 10 packets, the 5th one. */
@@ -280,23 +306,10 @@ netem_main_loop(void)
 	}
 }
 
-static void pq_thread(struct thread *thread) {
-	while (1) {
-		// wait for signal that there is data
-		pthread_cond_wait(thread->cond_data_in, thread->lock_data_in);
-
-		// apply maggic on packets
-		apply_modifiers(thread);
-
-		// send packets to TX
-		send_packets(thread);
-	}
-}
-
 // flag == 0, no modifications
 // flag == 1, packet will suffer modification as agreed by conventions (check defines)
 static void
-match_packet(void *m, char **buffer_changed, struct thread **threads) {
+match_packet(void *m, char *buffer_changed, struct thread **threads, uint16_t *rx_port_id) {
 	struct rte_ether_hdr *eth_hdr;
 	struct rte_ipv4_hdr *ip_hdr;
 
@@ -312,64 +325,43 @@ match_packet(void *m, char **buffer_changed, struct thread **threads) {
 		// try to add packet to queue
 		// if queue is full. drop packet
 		if (ip_hdr->next_proto_id == UDP_PROTOCOL) {
-			// get lock for UDP buffer
-			pthread_mutex_lock(threads[DUPLICATE_FLAG]->lock_data_in);
-
 			// put packet in buffer
 			if (rte_ring_enqueue(threads[DUPLICATE_FLAG]->buffer_in, m) < 0) {
 				rte_pktmbuf_free(m);
 				port_statistics[rx_port_id].dropped++;
 			}
 
-			// give lock back
-			pthread_mutex_unlock(threads[DUPLICATE_FLAG]->lock_data_in);
-
 			buffer_changed[DUPLICATE_FLAG] = 1;
 		} 
 		else if (ip_hdr->next_proto_id == TCP_PROTOCOL) {
-			// get lock for TCP buffer
-			pthread_mutex_lock(threads[DROP_FLAG]->lock_data_in);
-
 			if (rte_ring_enqueue(threads[DROP_FLAG]->buffer_in, m) < 0) {
 				rte_pktmbuf_free(m);
 				port_statistics[rx_port_id].dropped++;
 			}
-			// give lock back
-			pthread_mutex_unlock(threads[DUPLICATE_FLAG]->lock_data_in);
 
 			buffer_changed[DROP_FLAG] = 1;
 		} 
 		else if (ip_hdr->next_proto_id == IP_PROTOCOL_ICMP) {
-			// get lock for ICMP buffer
-			pthread_mutex_lock(threads[DELAY_FLAG]->lock_data_in);
-
 			if (rte_ring_enqueue(threads[DELAY_FLAG]->buffer_in, m) < 0) {
 				rte_pktmbuf_free(m);
 				port_statistics[rx_port_id].dropped++;
 			}
 
-			// give lock back
-			pthread_mutex_unlock(threads[DELAY_FLAG]->lock_data_in);
-
 			buffer_changed[DELAY_FLAG] = 1;
 		} 
 		else {
 			// add to default queue
-			pthread_mutex_lock(threads[PQ_NR]->lock_data_in);
-
 			if (rte_ring_enqueue(threads[PQ_NR]->buffer_in, m) < 0) {
 				rte_pktmbuf_free(m);
 				port_statistics[rx_port_id].dropped++;
 			}
 
-			// give lock back
-			pthread_mutex_unlock(threads[DELAY_FLAG]->lock_data_in);
 			buffer_changed[PQ_NR] = 1;
 		}
 	} 
 	else {
 		// not ipv4 packet, just add to default queue
-		if (rte_ring_enqueue(default_queue, m) < 0) {
+		if (rte_ring_enqueue(threads[PQ_NR]->buffer_in, m) < 0) {
 			rte_pktmbuf_free(m);
 			port_statistics[rx_port_id].dropped++;
 		}
