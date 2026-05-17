@@ -36,7 +36,7 @@
 #include <rte_udp.h>
 #include <rte_tcp.h>
 #include <rte_ring.h>
-#include <pthread.h>
+#include "main.h"
 
 static volatile bool force_quit;
 
@@ -46,23 +46,11 @@ static volatile bool force_quit;
 #define BURST_TX_DRAIN_US 100 /* TX drain every ~100us */
 #define MEMPOOL_CACHE_SIZE 256
 
-// UDP PACKETS WILL BE DUPLICATED RANDOMLY
-// TCP WILL BE DROPPED RANDOMLY
-// ICMP WILL BE DELAYED RANDOMLY
-// DEFINES FOR PACKET CLASIFICATION 
-#define IP_BROADCAST		FFFFFFFF
-#define UDP_PROTOCOL		17
-#define TCP_PROTOCOL		6
-#define IP_PROTOCOL_ICMP	1
-
-#define DELAY_MIN_MS  50
-#define DELAY_MAX_MS 150
-
 // profile queues
 struct rte_ring *udp_queue;
 struct rte_ring *tcp_queue;
 struct rte_ring *icmp_queue;
-
+uint64_t *icmp_delay_queue;
 struct rte_ring *default_queue;
 
 /*
@@ -199,8 +187,14 @@ netem_main_loop(void)
 
 	RTE_LOG(INFO, NETEM, "entering main loop on lcore %u\n", lcore_id);
 
-	pthread_cond_t *send_to_tx = malloc(sizeof(pthread_cond_t));
+	struct ctx *ctx = malloc(sizeof(struct ctx));
+	ctx->cond_PQ_data = malloc(sizeof(pthrea_cond_t));
+	ctx->lock_PQ_data = malloc(sizeof(pthread_mutex_t));
+	ctx->cond_send_to_tx = malloc(sizeof(pthrea_cond_t));
+	ctx->lock_send_to_tx = malloc(sizeof(pthread_mutex_t));
 
+	pthread_create(NULL, NULL, (void *)produser_thread, ctx);
+	pthread_create(NULL, NULL, (void *)consumer_thread, ctx);
 	while (!force_quit) {
 		/* Drains the TX queue after a certain time */
 		cur_tsc = rte_rdtsc();
@@ -244,7 +238,6 @@ netem_main_loop(void)
 		port_statistics[rx_port_id].rx += nb_rx;
 
 		// put packet in one of the queues
-		for (i = 0; i < nb_rx; i++) {
             m = pkts_burst[i];
             rte_prefetch0(rte_pktmbuf_mtod(m, void *));
 
@@ -253,10 +246,6 @@ netem_main_loop(void)
 
 		// matching is done. spawn a worker to start modifying the queues
 		// spawn a consumer that waits for the queues to be good for sending
-
-		pthread_create(NULL, NULL, (void *)produser_thread, send_to_tx);
-		pthread_create(NULL, NULL, (void *)consumer_thread, send_to_tx);
-
 
 			// /* Drop one in 10 packets, the 5th one. */
 			// if (i % 10 == 5) {
@@ -272,28 +261,31 @@ netem_main_loop(void)
 			// sent = rte_eth_tx_buffer(tx_port_id, 0, buffer, m);
 			// if (sent)
 			// 	port_statistics[tx_port_id].tx += sent;
-	}
+	
 }
 
-static void produser_thread(pthread_cond_t *send_to_tx) {
+static void produser_thread(struct ctx *ctx ) {
 	// go through each queue
 	// once every 5 packets do some magic
 
 	// UDP -> DUPLICATE
+	int packet_nr;
+	while (rte_ring_deq)
+
 	// TCP -> DROP
 	// ICMP DELAY
 
 	// after each queue is done signal pthread condition it is done
 }
 
-static void consumer_thread(pthread_cond_t *send_to_tx) {
+static void consumer_thread(struct ctx *ctx ) {
 	// wait on send_to_tx to be done
 	// do something like so
 	// buffer = tx_buffer[tx_port_id];
 
-			// sent = rte_eth_tx_buffer(tx_port_id, 0, buffer, m);
-			// if (sent)
-			// 	port_statistics[tx_port_id].tx += sent;
+	// sent = rte_eth_tx_buffer(tx_port_id, 0, buffer, m);
+	// if (sent)
+	// 	port_statistics[tx_port_id].tx += sent;
 }
 
 
@@ -413,6 +405,7 @@ main(int argc, char **argv)
     udp_queue = rte_ring_create("udp_queue", ring_size, rte_socket_id(), 0);
     tcp_queue = rte_ring_create("tcp_queue", ring_size, rte_socket_id(), 0);
     icmp_queue = rte_ring_create("icmp_queue", ring_size, rte_socket_id(), 0);
+	icmp_delay_queue = malloc(4096 * sizeof(uint64_t));
     default_queue = rte_ring_create("default_queue", ring_size, rte_socket_id(), 0);
 
     if (udp_queue == NULL || tcp_queue == NULL || icmp_queue == NULL || default_queue == NULL)
