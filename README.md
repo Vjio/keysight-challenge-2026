@@ -1,3 +1,11 @@
+threadul initial pune packetele unde trebuie
+
+incepe un worker thread daca aplica dropuri, duplicari, etc
+
+incepe un consumer thread care asteapta un semnal
+
+cand workerul termina de modificat o intreaga coada, ii da semnal consumerului sa le trimita
+
 # Keysight Student Challenge 2026
 ## Implement a Network Emulator to Duplicate, Drop, and Shape Network Traffic
 

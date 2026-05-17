@@ -38,6 +38,7 @@
 #include <rte_ring.h>
 #include "main.h"
 #include "threads.h"
+#include "list.h"
 
 static volatile bool force_quit;
 
@@ -181,7 +182,16 @@ netem_main_loop(void)
 	pthread_mutex_t *lock_TX = malloc(sizeof(pthread_mutex_t));
 	pthread_mutex_init(lock_TX, NULL);  
 
-	struct thread **threads = malloc((PQ_NR + 1) * sizeof(struct thread *));
+	// in order to dinamically spawn new threads when a very large ammount of packets arrives
+	// we will host a PQ_NR lists, each keeping track of how many worker threads
+	// there are for each PQ
+	// thus, if a PQ has like 10 packets, it will only have 1 worker
+	// but if one PQ has 10 000 packets, it will have multiple workers
+	struct double_list **thread_list = malloc((PQ_NR + 1) * sizeof(struct double_list*));
+
+	for (int i = 1; i <= PQ_NR; i++)
+		thread_list[i] = initList();
+
 	for (int i = 1; i <= PQ_NR; i++) {
 		struct thread *thread = malloc(sizeof(struct thread));
 
@@ -193,15 +203,23 @@ netem_main_loop(void)
 		thread->buffer_in = rte_ring_create(name_buffer_in, RING_SIZE, rte_socket_id(), 0);
 		thread->buffer_out = rte_ring_create(name_buffer_out, RING_SIZE, rte_socket_id(), 0);
 
+		// internal buffer locks
 		thread->cond_data_in = malloc(sizeof(pthread_cond_t));
 		thread->lock_data_in = malloc(sizeof(pthread_mutex_t));
+
+		// lock for managing sending out packets
 		thread->lock_TX = lock_TX;
+
+		// lock for managing each PQ's list
+		thread->lock_list = malloc(sizeof(pthread_mutex_t));
 
 		pthread_cond_init(thread->cond_data_in, NULL);
 		pthread_mutex_init(thread->lock_data_in, NULL);  
+		pthread_mutex_init(thread->lock_list, NULL);  
 
 		// keep thread data in main array's storage
-		threads[i] = thread;
+		thread_list[i] = insertRear(thread_list[i], thread);
+		thread_list[i]->node_nr = 1;
 
 		// alloc mem for input args for worker thread
 		struct pq_thread_args *args = malloc(sizeof(struct pq_thread_args));
@@ -213,6 +231,8 @@ netem_main_loop(void)
 
 		// populate input struc
 		args->thread = thread;
+		args->node = findNode(thread_list[i], thread);
+		args->thread_list = thread_list[i];
 		args->tx_port_id = tx_port_id;
 		args->rx_port_id = rx_port_id;
 		args->tx_buffer = tx_buffer;
@@ -266,26 +286,41 @@ netem_main_loop(void)
 		port_statistics[rx_port_id].rx += nb_rx;
 
 		// try to acquire all locks
-		for (int i = 1; i <= PQ_NR; i++)
-			pthread_mutex_lock(threads[i]->lock_data_in);
+		for (int i = 1; i <= PQ_NR; i++) {
+			Node *node = thread_list[i]->head;
+			while (node != NULL) {
+				pthread_mutex_lock(node->current->lock_data_in);
+				node = node->next;
+			}
+		}
 
 		char buffer_changed[PQ_NR + 1] = {0};
 		// put packet in one of the queues
 		for (i = 0; i < nb_rx; i++) {
             m = pkts_burst[i];
             rte_prefetch0(rte_pktmbuf_mtod(m, void *));
-
-			match_packet(m, buffer_changed, threads, &rx_port_id);
+			match_packet(m, buffer_changed, thread_list, &rx_port_id, 
+				tx_port_id, lcore_id, tx_buffer, port_statistics);
 		}
 
 		// give all locks back
-		for (int i = 1; i <= PQ_NR; i++)
-			pthread_mutex_unlock(threads[i]->lock_data_in);
+		for (int i = 1; i <= PQ_NR; i++) {
+			Node *node = thread_list[i]->head;
+			while (node != NULL) {
+				pthread_mutex_unlock(node->current->lock_data_in);
+				node = node->next;
+			}
+		}
 
-		// tell each worker thread who has new data to wake up
-		for (int i = 1; i <= PQ_NR; i++)
-			if (buffer_changed[i] == 1)
-				pthread_cond_signal(threads[i]->cond_data_in);
+		for (int i = 1; i <= PQ_NR; i++) {
+		if (buffer_changed[i] == 1) {
+			Node *node = thread_list[i]->head;
+			while (node != NULL) {
+				pthread_cond_signal(node->current->cond_data_in);
+				node = node->next;
+			}
+		}
+	}
 
 			// /* Drop one in 10 packets, the 5th one. */
 			// if (i % 10 == 5) {
@@ -306,8 +341,11 @@ netem_main_loop(void)
 
 // flag == 0, no modifications
 // flag == 1, packet will suffer modification as agreed by conventions (check defines)
-void match_packet(struct rte_mbuf *m, char *buffer_changed, 
-	struct thread **threads, uint16_t *rx_port_id) {
+void match_packet(struct rte_mbuf *m, char *buffer_changed,
+    struct double_list **thread_list, uint16_t *rx_port_id,
+    uint16_t tx_port_id, unsigned lcore_id,
+    struct rte_eth_dev_tx_buffer **tx_buffer,
+    struct netem_port_statistics *port_statistics) {
 	struct rte_ether_hdr *eth_hdr;
 	struct rte_ipv4_hdr *ip_hdr;
 
@@ -323,38 +361,36 @@ void match_packet(struct rte_mbuf *m, char *buffer_changed,
 		// try to add packet to queue
 		// if queue is full. drop packet
 
-		// TODO: if rte_ring_enqueue fails because of a full buffer
-		// spawn a new thread and start filling its buffer
 		if (ip_hdr->next_proto_id == UDP_PROTOCOL) {
 			// put packet in buffer
-			if (rte_ring_enqueue(threads[DUPLICATE_FLAG]->buffer_in, m) < 0) {
-				rte_pktmbuf_free(m);
-				port_statistics[*rx_port_id].dropped++;
+			if (rte_ring_enqueue(thread_list[DUPLICATE_FLAG]->head->current->buffer_in, m) < 0) {
+				handle_full_buffer(thread_list, DUPLICATE_FLAG, i, m, lcore_id,
+                   tx_port_id, rx_port_id, tx_buffer, port_statistics);
 			}
 
 			buffer_changed[DUPLICATE_FLAG] = 1;
 		} 
 		else if (ip_hdr->next_proto_id == TCP_PROTOCOL) {
-			if (rte_ring_enqueue(threads[DROP_FLAG]->buffer_in, m) < 0) {
-				rte_pktmbuf_free(m);
-				port_statistics[*rx_port_id].dropped++;
+			if (rte_ring_enqueue(thread_list[DROP_FLAG]->head->current->buffer_in, m) < 0) {
+				handle_full_buffer(thread_list, DROP_FLAG, i, m, lcore_id,
+                   tx_port_id, rx_port_id, tx_buffer, port_statistics);
 			}
 
 			buffer_changed[DROP_FLAG] = 1;
 		} 
 		else if (ip_hdr->next_proto_id == IP_PROTOCOL_ICMP) {
-			if (rte_ring_enqueue(threads[DELAY_FLAG]->buffer_in, m) < 0) {
-				rte_pktmbuf_free(m);
-				port_statistics[*rx_port_id].dropped++;
+			if (rte_ring_enqueue(thread_list[DELAY_FLAG]->head->current->buffer_in, m) < 0) {
+				handle_full_buffer(thread_list, DELAY_FLAG, i, m, lcore_id,
+                   tx_port_id, rx_port_id, tx_buffer, port_statistics);
 			}
 
 			buffer_changed[DELAY_FLAG] = 1;
 		} 
 		else {
 			// add to default queue
-			if (rte_ring_enqueue(threads[PQ_NR]->buffer_in, m) < 0) {
-				rte_pktmbuf_free(m);
-				port_statistics[*rx_port_id].dropped++;
+			if (rte_ring_enqueue(thread_list[DUPLICATE_FLAG]->head->current->buffer_in, m) < 0) {
+				handle_full_buffer(thread_list, DELAY_FLAG, i, m, lcore_id,
+                   tx_port_id, rx_port_id, tx_buffer, port_statistics);
 			}
 
 			buffer_changed[PQ_NR] = 1;
@@ -362,9 +398,9 @@ void match_packet(struct rte_mbuf *m, char *buffer_changed,
 	} 
 	else {
 		// not ipv4 packet, just add to default queue
-		if (rte_ring_enqueue(threads[PQ_NR]->buffer_in, m) < 0) {
-			rte_pktmbuf_free(m);
-			port_statistics[*rx_port_id].dropped++;
+		if (rte_ring_enqueue(thread_list[DUPLICATE_FLAG]->head->current->buffer_in, m) < 0) {
+			handle_full_buffer(thread_list, DELAY_FLAG, i, m, lcore_id,
+				tx_port_id, rx_port_id, tx_buffer, port_statistics);
 		}
 	}
 }
