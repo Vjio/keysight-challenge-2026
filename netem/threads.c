@@ -1,12 +1,14 @@
 #include "main.h"
 #include "threads.h"
 
-static void *pq_thread(void *arg) {
+void *pq_thread(void *arg) {
     struct pq_thread_args *args = (struct pq_thread_args *)arg;
     
     struct thread *thread = args->thread;
     uint16_t tx_port_id = args->tx_port_id;
-    struct rte_eth_dev_tx_buffer *tx_buffer = args->tx_buffer;
+    uint16_t rx_port_id = args->rx_port_id;
+    struct rte_eth_dev_tx_buffer **tx_buffer = args->tx_buffer;
+    struct netem_port_statistics *port_statistics = args->port_statistics;
 
 	while (1) {
         // lock mutex
@@ -21,17 +23,18 @@ static void *pq_thread(void *arg) {
         pthread_mutex_unlock(thread->lock_data_in);
 
 		// apply maggic on packets
-		apply_modifiers(thread);
+		apply_modifiers(thread, port_statistics, rx_port_id);
 
 		// send packets to TX
-		send_packets(thread, tx_port_id, tx_buffer);
+		send_packets(thread, tx_port_id, tx_buffer, port_statistics);
 	}
 
+    free(args);
     return NULL;
 }
 
 void send_packets(struct thread *thread, uint16_t tx_port_id, 
-    struct rte_eth_dev_tx_buffer *tx_buffer) {
+    struct rte_eth_dev_tx_buffer **tx_buffer, struct netem_port_statistics *port_statistics) {
 	struct rte_mbuf *pkts[8];
 	unsigned int nb_pkts;
 	unsigned int i;
@@ -52,7 +55,8 @@ void send_packets(struct thread *thread, uint16_t tx_port_id,
 	pthread_mutex_unlock(thread->lock_TX);
 }
 
-void apply_modifiers(struct thread *thread) {
+void apply_modifiers(struct thread *thread, struct netem_port_statistics *port_statistics,
+    uint16_t rx_port_id) {
 	struct rte_mbuf *pkts[BURST_SIZE];
 	unsigned int nb_pkts;
 	unsigned int i;
@@ -68,7 +72,7 @@ void apply_modifiers(struct thread *thread) {
 		struct rte_mbuf *m = pkts[i];
 		cnt++;
 		switch(thread->flag) {
-			case DUPLICATE_FLAG:
+			case DUPLICATE_FLAG: {
 				rte_ring_enqueue(thread->buffer_out, m);
 				struct rte_mbuf *copy = rte_pktmbuf_clone(m, m->pool);
 
@@ -76,17 +80,18 @@ void apply_modifiers(struct thread *thread) {
 					rte_ring_enqueue(thread->buffer_out, copy);
 
 				break;
+            }
 			
 			case DROP_FLAG:
 				if (cnt % DROP_FLAG_WHEN == 0) {
 					rte_pktmbuf_free(m);
+                    port_statistics[rx_port_id].dropped++;
 					continue;
 				}
 
 				rte_ring_enqueue(thread->buffer_out, m);
 				
 				break;
-
 
 			case DELAY_FLAG:
 				if (cnt % DELAY_FLAG_WHEN == 0) {

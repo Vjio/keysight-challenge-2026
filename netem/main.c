@@ -72,12 +72,6 @@ static struct rte_eth_conf port_conf = {
 
 struct rte_mempool * netem_pktmbuf_pool = NULL;
 
-/* Per-port statistics struct */
-struct __rte_cache_aligned netem_port_statistics {
-	uint64_t tx;
-	uint64_t rx;
-	uint64_t dropped;
-};
 struct netem_port_statistics port_statistics[NB_PORTS];
 
 /* A tsc-based timer responsible for triggering statistics printout */
@@ -119,6 +113,8 @@ print_stats(void)
 	printf("%s%s", clr, topLeft);
 
 	printf("\nPort statistics ====================================");
+
+	printf("\n SALUT \n");
 
 	for (portid = 0; portid < NB_PORTS; portid++) {
 		printf("\nStatistics for port %u ------------------------------"
@@ -191,8 +187,8 @@ netem_main_loop(void)
 
 		char name_buffer_in[32];
     	char name_buffer_out[32];
-		sprintf(name_buffer_in, "buffer_in%d", i);
-		sprintf(name_buffer_out, "buffer_out%d", i);
+		sprintf(name_buffer_in, "buffer_in%d%d", lcore_id, i);
+		sprintf(name_buffer_out, "buffer_out%d%d", lcore_id, i);
 	
 		thread->buffer_in = rte_ring_create(name_buffer_in, RING_SIZE, rte_socket_id(), 0);
 		thread->buffer_out = rte_ring_create(name_buffer_out, RING_SIZE, rte_socket_id(), 0);
@@ -212,13 +208,15 @@ netem_main_loop(void)
 		if (args == NULL) {
 			// Handle memory allocation failure
 			fprintf(stderr, "Failed to allocate memory for thread args\n");
-			return -1;
+			return;
 		}
 
 		// populate input struc
 		args->thread = thread;
 		args->tx_port_id = tx_port_id;
+		args->rx_port_id = rx_port_id;
 		args->tx_buffer = tx_buffer;
+		args->port_statistics = port_statistics;
 
 		thread->flag = i;
 		pthread_t tid;
@@ -308,8 +306,8 @@ netem_main_loop(void)
 
 // flag == 0, no modifications
 // flag == 1, packet will suffer modification as agreed by conventions (check defines)
-static void
-match_packet(void *m, char *buffer_changed, struct thread **threads, uint16_t *rx_port_id) {
+void match_packet(struct rte_mbuf *m, char *buffer_changed, 
+	struct thread **threads, uint16_t *rx_port_id) {
 	struct rte_ether_hdr *eth_hdr;
 	struct rte_ipv4_hdr *ip_hdr;
 
@@ -324,11 +322,14 @@ match_packet(void *m, char *buffer_changed, struct thread **threads, uint16_t *r
 		// pattern match for a queue
 		// try to add packet to queue
 		// if queue is full. drop packet
+
+		// TODO: if rte_ring_enqueue fails because of a full buffer
+		// spawn a new thread and start filling its buffer
 		if (ip_hdr->next_proto_id == UDP_PROTOCOL) {
 			// put packet in buffer
 			if (rte_ring_enqueue(threads[DUPLICATE_FLAG]->buffer_in, m) < 0) {
 				rte_pktmbuf_free(m);
-				port_statistics[rx_port_id].dropped++;
+				port_statistics[*rx_port_id].dropped++;
 			}
 
 			buffer_changed[DUPLICATE_FLAG] = 1;
@@ -336,7 +337,7 @@ match_packet(void *m, char *buffer_changed, struct thread **threads, uint16_t *r
 		else if (ip_hdr->next_proto_id == TCP_PROTOCOL) {
 			if (rte_ring_enqueue(threads[DROP_FLAG]->buffer_in, m) < 0) {
 				rte_pktmbuf_free(m);
-				port_statistics[rx_port_id].dropped++;
+				port_statistics[*rx_port_id].dropped++;
 			}
 
 			buffer_changed[DROP_FLAG] = 1;
@@ -344,7 +345,7 @@ match_packet(void *m, char *buffer_changed, struct thread **threads, uint16_t *r
 		else if (ip_hdr->next_proto_id == IP_PROTOCOL_ICMP) {
 			if (rte_ring_enqueue(threads[DELAY_FLAG]->buffer_in, m) < 0) {
 				rte_pktmbuf_free(m);
-				port_statistics[rx_port_id].dropped++;
+				port_statistics[*rx_port_id].dropped++;
 			}
 
 			buffer_changed[DELAY_FLAG] = 1;
@@ -353,7 +354,7 @@ match_packet(void *m, char *buffer_changed, struct thread **threads, uint16_t *r
 			// add to default queue
 			if (rte_ring_enqueue(threads[PQ_NR]->buffer_in, m) < 0) {
 				rte_pktmbuf_free(m);
-				port_statistics[rx_port_id].dropped++;
+				port_statistics[*rx_port_id].dropped++;
 			}
 
 			buffer_changed[PQ_NR] = 1;
@@ -363,7 +364,7 @@ match_packet(void *m, char *buffer_changed, struct thread **threads, uint16_t *r
 		// not ipv4 packet, just add to default queue
 		if (rte_ring_enqueue(threads[PQ_NR]->buffer_in, m) < 0) {
 			rte_pktmbuf_free(m);
-			port_statistics[rx_port_id].dropped++;
+			port_statistics[*rx_port_id].dropped++;
 		}
 	}
 }

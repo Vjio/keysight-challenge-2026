@@ -1,6 +1,9 @@
 #ifndef __MAIN_H__
 #define __MAIN_H__
 
+#include <stdint.h>
+#include <rte_common.h>
+
 // UDP PACKETS WILL BE DUPLICATED RANDOMLY
 // TCP WILL BE DROPPED RANDOMLY
 // ICMP WILL BE DELAYED RANDOMLY
@@ -25,5 +28,13 @@
 
 #define DELAY_MIN_MS  50
 #define DELAY_MAX_MS 150
+
+/* Per-port statistics struct */
+struct netem_port_statistics {
+	uint64_t tx;
+	uint64_t rx;
+	uint64_t dropped;
+} __rte_cache_aligned;
+
 
 #endif
